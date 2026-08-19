@@ -1,0 +1,11 @@
+Package: preferenceloader
+Name: PreferenceLoader
+Version: 2.3
+Architecture: iphoneos-arm
+Description: A MobileSubstrate-based utility that allows developers to add entries to the Settings application
+Maintainer: Dhinak G <dhinak@dhinak.net>
+Author: Dustin Howett <dustin@howett.net>
+Section: System
+Depends: mobilesubstrate, firmware (>= 15.0)
+Conflicts: preferenceloader-legacy
+Replaces: preferenceloader-legacy
