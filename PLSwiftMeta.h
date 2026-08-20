@@ -27,6 +27,19 @@ size_t PLSwiftTypeStride(const void *metadata);
 // metadata's field offset vector, names from the reflection field descriptor.
 int32_t PLSwiftStructOffsetOfField(const void *metadata, const char *name);
 
+// Byte offset of a stored property of a class, or -1 if there is no such property. Separate from
+// the struct reader: a class keeps its descriptor past the ObjC-interop header and its field
+// offsets are pointer-sized rather than 32-bit.
+int32_t PLSwiftClassOffsetOfField(const void *metadata, const char *name);
+
+// Allocates an instance of a Swift class with the header set up and the stored properties left
+// uninitialised; every one has to be written before the object is handed anywhere. NULL when the
+// metadata is not a class.
+//
+// Needed because the classes worth building come from a module shipped without Swift symbols, so
+// there is no initialiser to call.
+void *PLSwiftAllocObject(const void *metadata);
+
 // Enum case of the value at `value`, and the name for a case index.
 uint32_t PLSwiftEnumTag(const void *value, const void *metadata);
 const char *PLSwiftEnumCaseName(const void *metadata, uint32_t tag);
@@ -73,6 +86,14 @@ NSInteger PLSwiftArrayCapacity(const void *arrayField);
 
 // Address of element `index`, or NULL when out of range.
 const void *PLSwiftArrayElement(const void *arrayField, NSInteger index, size_t stride);
+
+// Implemented in PLSwiftToggle.swift; see there for why they are not plain C.
+typedef void (*PLBoolCallback)(const void *token, BOOL value);
+BOOL PLSwiftObservationRegistrarInitialize(void *out);
+NSInteger PLSwiftObservationRegistrarSize(void);
+void PLSwiftBoolClosureInitialize(void *out, PLBoolCallback callback, const void *token);
+void PLSwiftBoolClosureDestroy(void *pointer);
+NSInteger PLSwiftBoolClosureSize(void);
 
 // Implemented in PLSwiftString.swift; see there for why they are not plain C.
 void PLSwiftStringInitialize(const char *cString, void *out);

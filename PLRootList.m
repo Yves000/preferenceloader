@@ -15,6 +15,20 @@
 - (void)setRootController:(id)controller;
 - (void)setParentController:(id)controller;
 @end
+
+// A pane for an entry that is a control rather than a link, used where the inline switch row
+// cannot be built.
+//
+// It also has to exist for such a row to be safe to tap at all: libprefs gives every non-bundle
+// entry a PLCustomListController (see -specifiersFromEntry:... in prefs.xm), which only entries
+// that open a page ever reached. Asked to open a switch entry it re-reads that entry's plist for
+// an `items` array a PreferenceLoader entry does not have, and Settings goes down with it.
+@interface PLEntryPaneController : PSListController
+- (void)setPaneSpecifiers:(NSArray *)specifiers;
+@end
+
+#import <dlfcn.h>
+#import <ptrauth.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -60,10 +74,16 @@ static const char *const kPLSectionIDType    = "11SettingsApp36PrimarySettingsLi
 static const char *const kPLItemIDType       = "11SettingsApp33PrimarySettingsListItemIdentifierO";
 static const char *const kPLItemViewType     = "11SettingsApp31PrimarySettingsListItemViewTypeO";
 static const char *const kPLLinkModelType    = "11SettingsApp28PrimarySettingsListLinkModelV";
+static const char *const kPLToggleModelType  = "11SettingsApp30PrimarySettingsListToggleModelV";
+static const char *const kPLToggleStateType  = "11SettingsApp30PrimarySettingsListToggleStateC";
 static const char *const kPLIconTypeType     = "11SettingsApp4IconV8IconTypeO";
 
 // Tag of Icon.IconType.image(uiImage:), the first of its payload cases.
 enum { kPLIconImageTag = 0 };
+
+// The case of PrimarySettingsListItemViewType that carries a switch. Resolved by name like every
+// other case, because the positions move between releases.
+static const char *const kPLToggleCase = "toggle";
 
 static NSString *const kPLListModelClass = @"_TtC11SettingsApp24PrimarySettingsListModel";
 
@@ -80,6 +100,8 @@ typedef struct {
     const void *itemIDMeta;
     const void *viewTypeMeta;
     const void *linkMeta;
+    const void *toggleMeta;
+    const void *toggleStateMeta;
 
     size_t sectionStride;
     size_t itemStride;
@@ -90,6 +112,18 @@ typedef struct {
     int32_t itemID;
     int32_t itemViewType;
     int32_t linkTitle;
+    int32_t linkIcon;
+
+    // The toggle row: the case, the model it carries, and the three stored properties of the
+    // observable object that drives it. All -1 / UINT32_MAX when this release has no such row,
+    // which is what sends a switch entry down the pane path instead.
+    uint32_t toggleTag;
+    int32_t toggleIcon;
+    int32_t toggleTitle;
+    int32_t toggleState;
+    int32_t stateIsOn;
+    int32_t stateSetIsOn;
+    int32_t stateRegistrar;
 
     const void *snapshot;   // the section array field inside _cachedDataModel
     NSInteger sectionCount;
@@ -105,6 +139,8 @@ static BOOL PLResolve(PLRootContext *ctx) {
     ctx->itemIDMeta    = PLSwiftTypeByMangledName(kPLItemIDType);
     ctx->viewTypeMeta  = PLSwiftTypeByMangledName(kPLItemViewType);
     ctx->linkMeta      = PLSwiftTypeByMangledName(kPLLinkModelType);
+    ctx->toggleMeta      = PLSwiftTypeByMangledName(kPLToggleModelType);
+    ctx->toggleStateMeta = PLSwiftTypeByMangledName(kPLToggleStateType);
     if (!ctx->sectionMeta || !ctx->itemMeta) return NO;
 
     ctx->sectionStride = PLSwiftTypeStride(ctx->sectionMeta);
@@ -117,7 +153,18 @@ static BOOL PLResolve(PLRootContext *ctx) {
     ctx->itemID        = PLSwiftStructOffsetOfField(ctx->itemMeta, "id");
     ctx->itemViewType  = PLSwiftStructOffsetOfField(ctx->itemMeta, "viewType");
     ctx->linkTitle     = ctx->linkMeta ? PLSwiftStructOffsetOfField(ctx->linkMeta, "primaryText") : -1;
+    ctx->linkIcon      = ctx->linkMeta ? PLSwiftStructOffsetOfField(ctx->linkMeta, "icon") : -1;
     if (ctx->sectionItems < 0 || ctx->itemViewType < 0) return NO;
+
+    ctx->toggleTag      = ctx->viewTypeMeta ? PLSwiftEnumTagNamed(ctx->viewTypeMeta, kPLToggleCase)
+                                            : UINT32_MAX;
+    ctx->toggleIcon     = ctx->toggleMeta ? PLSwiftStructOffsetOfField(ctx->toggleMeta, "icon") : -1;
+    ctx->toggleTitle    = ctx->toggleMeta ? PLSwiftStructOffsetOfField(ctx->toggleMeta, "primaryText") : -1;
+    ctx->toggleState    = ctx->toggleMeta ? PLSwiftStructOffsetOfField(ctx->toggleMeta, "state") : -1;
+    ctx->stateIsOn      = ctx->toggleStateMeta ? PLSwiftClassOffsetOfField(ctx->toggleStateMeta, "_isOn") : -1;
+    ctx->stateSetIsOn   = ctx->toggleStateMeta ? PLSwiftClassOffsetOfField(ctx->toggleStateMeta, "setIsOn") : -1;
+    ctx->stateRegistrar = ctx->toggleStateMeta
+        ? PLSwiftClassOffsetOfField(ctx->toggleStateMeta, "_$observationRegistrar") : -1;
 
     Class listModel = objc_getClass(kPLListModelClass.UTF8String);
     if (!listModel) return NO;
@@ -179,6 +226,15 @@ static NSString *PLPreferenceBundlesDirectory(void) {
     return jbroot(@"/Library/PreferenceBundles");
 }
 
+// The directory the entry's plist was read out of. That is the Preferences directory itself for
+// an ordinary entry, and a subdirectory for a localized one -- which libprefs recognises by the
+// directory not being named Preferences, and takes strings and the icon out of.
+static NSString *PLEntrySourceDirectory(NSDictionary *record) {
+    NSString *source = record[@"source"];
+    if ([source isKindOfClass:NSString.class] && source.length) return source;
+    return PLPreferencesDirectory();
+}
+
 // Marks a row as ours. Written into the carrier case's String, and read back both to resolve a
 // tap and to recognise a section this tweak has already injected.
 static const char *const kPLIdentityPrefix = "PLTweak:";
@@ -210,21 +266,33 @@ static NSArray<NSString *> *PLTweakTitles(void) {
     dispatch_once(&once, ^{
         NSString *directory = PLPreferencesDirectory();
         NSMutableArray<NSString *> *found = [NSMutableArray array];
-        for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:directory error:NULL]) {
-            if (![name.pathExtension isEqualToString:@"plist"]) continue;
-            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:
-                                      [directory stringByAppendingPathComponent:name]];
-            // Same shape PreferenceLoader itself reads, so the two agree on what a tweak is.
-            NSDictionary *entry = [plist isKindOfClass:NSDictionary.class] ? plist[@"entry"] : nil;
-            NSString *label = [entry isKindOfClass:NSDictionary.class] ? entry[@"label"] : nil;
+        // Recursive, like the specifier injection in Tweak.xm. An entry shipped inside a
+        // subdirectory is a localized one, and enumerating only the top level left those out of
+        // the list altogether.
+        for (NSString *item in [NSFileManager.defaultManager subpathsOfDirectoryAtPath:directory error:NULL]) {
+            if (![item.pathExtension isEqualToString:@"plist"]) continue;
+            NSString *path = [directory stringByAppendingPathComponent:item];
+            // Same shape PreferenceLoader itself reads, and the same two filters it applies, so
+            // the two agree both on what a tweak is and on which ones this firmware shows.
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (![plist isKindOfClass:NSDictionary.class]) continue;
+            if (![PSSpecifier environmentPassesPreferenceLoaderFilter:plist[@"filter"] ?: plist[PLFilterKey]]) continue;
+
+            NSDictionary *entry = plist[@"entry"];
+            if (![entry isKindOfClass:NSDictionary.class]) continue;
+            if (![PSSpecifier environmentPassesPreferenceLoaderFilter:entry[PLFilterKey]]) continue;
+
+            NSString *label = entry[@"label"];
             if (![label isKindOfClass:NSString.class] || !label.length) continue;
 
             [found addObject:label];
             // The plist's own name is kept: libprefs takes it as the title argument when it
             // turns an entry into specifiers, and a bundle without an explicit label falls back
-            // to it.
+            // to it. Its directory is kept because libprefs wants that too, as the bundle the
+            // entry's strings come out of, and because the icon sits beside the plist.
             PLEntriesByTitle()[label] = @{ @"entry": entry,
-                                          @"name": name.stringByDeletingPathExtension };
+                                          @"name": item.lastPathComponent.stringByDeletingPathExtension,
+                                          @"source": path.stringByDeletingLastPathComponent };
         }
         [found sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
         titles = [found copy];
@@ -233,7 +301,9 @@ static NSArray<NSString *> *PLTweakTitles(void) {
 }
 
 // The image a PreferenceLoader entry names, looked up the way PreferenceLoader looks it up.
-static UIImage *PLIconForEntry(NSDictionary *entry) {
+static UIImage *PLIconForEntry(NSDictionary *record) {
+    NSDictionary *entry = record[@"entry"];
+    if (![entry isKindOfClass:NSDictionary.class]) return nil;
     NSString *name = entry[@"icon"];
     NSString *bundleName = entry[@"bundle"];
     if (![name isKindOfClass:NSString.class] || !name.length) return nil;
@@ -244,7 +314,11 @@ static UIImage *PLIconForEntry(NSDictionary *entry) {
                                 stringByAppendingPathComponent:
                                     [NSString stringWithFormat:@"%@.bundle", bundleName]]];
     }
-    [directories addObject:PLPreferencesDirectory()];
+    // The entry's own directory first: a localized entry ships its icon beside its plist, and
+    // for every other entry this is the Preferences directory that follows anyway.
+    NSString *source = PLEntrySourceDirectory(record);
+    [directories addObject:source];
+    if (![source isEqualToString:PLPreferencesDirectory()]) [directories addObject:PLPreferencesDirectory()];
 
     for (NSString *directory in directories) {
         NSString *path = [directory stringByAppendingPathComponent:name];
@@ -259,6 +333,284 @@ static UIImage *PLIconForEntry(NSDictionary *entry) {
         }
     }
     return nil;
+}
+
+// --- inline switch rows ---------------------------------------------------------------------
+//
+// An entry whose cell is a PSSwitchCell is the tweak's switch itself, not a link to a page. The
+// SwiftUI list has a row shape for that -- the toggle case of PrimarySettingsListItemViewType,
+// carrying a PrimarySettingsListToggleModel -- so the entry becomes one of those.
+//
+// The model's `state` is an @Observable class holding the value and a closure to run when the
+// switch is flipped. SettingsApp ships without Swift symbols for it, so the object is allocated
+// and its stored properties written individually; PLSwiftToggle.swift builds the two that have no
+// C representation.
+//
+// Every step is conditional on the metadata resolving. Where it does not, the entry falls back to
+// the link row and the pane behind it.
+
+// Read from the plist rather than from a specifier: the injection runs at launch, and building
+// specifiers for every installed tweak then is what the entry cache exists to avoid.
+static BOOL PLEntryIsInlineSwitch(NSDictionary *entry) {
+    if (![entry isKindOfClass:NSDictionary.class]) return NO;
+    // A bundle is a page whatever cell the row is drawn with.
+    if (entry[@"bundle"]) return NO;
+    NSString *cell = entry[@"cell"];
+    if (![cell isKindOfClass:NSString.class] || ![cell isEqualToString:@"PSSwitchCell"]) return NO;
+    // Without a domain and a key there is nothing to read or write.
+    return [entry[@"defaults"] isKindOfClass:NSString.class] &&
+           [entry[@"key"] isKindOfClass:NSString.class];
+}
+
+// Read as Preferences reads it for a PSSwitchCell: from the entry's defaults domain, falling back
+// to the default the entry states.
+static BOOL PLEntrySwitchValue(NSDictionary *entry) {
+    CFPropertyListRef value = CFPreferencesCopyAppValue((CFStringRef)entry[@"key"],
+                                                        (CFStringRef)entry[@"defaults"]);
+    if (!value) return [entry[@"default"] boolValue];
+    // Numbers and booleans both, because both are written in practice.
+    BOOL result = [(id)value respondsToSelector:@selector(boolValue)] ? [(id)value boolValue] : NO;
+    CFRelease(value);
+    return result;
+}
+
+// Write, then post the notification the tweak is listening for -- the same sequence
+// -[PSViewController setPreferenceValue:specifier:] performs.
+static void PLEntrySetSwitchValue(NSDictionary *entry, BOOL value) {
+    CFPreferencesSetAppValue((CFStringRef)entry[@"key"],
+                             value ? kCFBooleanTrue : kCFBooleanFalse,
+                             (CFStringRef)entry[@"defaults"]);
+    CFPreferencesAppSynchronize((CFStringRef)entry[@"defaults"]);
+
+    NSString *notification = entry[@"PostNotification"];
+    if ([notification isKindOfClass:NSString.class] && notification.length) {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (CFStringRef)notification, NULL, NULL, YES);
+    }
+}
+
+// Handed to the closure in a row's state object so it knows which entry was flipped. The state
+// pointer is unowned; the row's model owns the object.
+@interface PLToggleBinding : NSObject
+@property (nonatomic, retain) NSDictionary *entry;
+@property (nonatomic, assign) void *state;
+@end
+@implementation PLToggleBinding
+@end
+
+// One binding per row, kept for the life of the process: every model rebuild needs a new state
+// object, but a closure from an earlier rebuild must stay callable until its row is released.
+static PLToggleBinding *PLBindingForTitle(NSString *title, NSDictionary *entry) {
+    static NSMutableDictionary<NSString *, PLToggleBinding *> *bindings;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ bindings = [[NSMutableDictionary alloc] init]; });
+
+    PLToggleBinding *binding = bindings[title];
+    if (!binding) {
+        binding = [[[PLToggleBinding alloc] init] autorelease];
+        binding.entry = entry;
+        bindings[title] = binding;
+    }
+    return binding;
+}
+
+// Remembered when the object is built so the callback, which runs inside SwiftUI's update, does
+// not have to resolve the model again.
+static int32_t gPLStateIsOnOffset = -1;
+
+static void PLToggleChanged(const void *token, BOOL value) {
+    PLToggleBinding *binding = (PLToggleBinding *)token;
+    if (![binding isKindOfClass:PLToggleBinding.class]) return;
+
+    PLEntrySetSwitchValue(binding.entry, value);
+
+    // Nothing else writes the value back, so without this the row springs back under the finger.
+    if (binding.state && gPLStateIsOnOffset >= 0) {
+        *((uint8_t *)binding.state + gPLStateIsOnOffset) = value ? 1 : 0;
+    }
+}
+
+// Whether a closure built here is signed the way Settings authenticates the field it goes into.
+//
+// Checked rather than assumed, because a mismatch is not a crash: an unauthenticated pointer is
+// poisoned rather than rejected, the branch lands outside the address space, and Settings spins
+// there until the watchdog kills it -- and only when someone flips the switch, long after the
+// injection that caused it.
+//
+// The two pointers address different code, so their signatures cannot be compared directly.
+// Instead the discriminator that authenticates a probe built here is recovered by search, and
+// Apple's own switch (Airplane Mode) has to authenticate under the same one. Sixteen bits is
+// small enough to search, and a wrong candidate merely yields a wrong pointer.
+//
+// Only on arm64e; elsewhere nothing is signed.
+#if __has_feature(ptrauth_calls)
+
+// The state object behind the first switch row Settings put in the list itself, or NULL if it has
+// none. Taken from the model rather than by searching the heap: the injection runs inside
+// SwiftUI's update, where enumerating the malloc zones would hold each zone's lock (see PLHeap.h).
+static const void *PLSampleToggleState(PLRootContext *ctx) {
+    size_t viewTypeSize = PLSwiftTypeSize(ctx->viewTypeMeta);
+    uint8_t scratch[128];
+    if (viewTypeSize == 0 || viewTypeSize > sizeof(scratch)) return NULL;
+
+    for (NSInteger i = 0; i < ctx->sectionCount; i++) {
+        const void *section = PLSwiftArrayElement(ctx->snapshot, i, ctx->sectionStride);
+        if (!section) continue;
+        const void *items = (const uint8_t *)section + ctx->sectionItems;
+        NSInteger count = PLSwiftArrayCount(items);
+        for (NSInteger j = 0; j < count; j++) {
+            const void *item = PLSwiftArrayElement(items, j, ctx->itemStride);
+            if (!item) continue;
+            const void *viewType = (const uint8_t *)item + ctx->itemViewType;
+            if (PLSwiftEnumTag(viewType, ctx->viewTypeMeta) != ctx->toggleTag) continue;
+
+            // Projecting rewrites the value in place, so a copy is projected instead.
+            PLSwiftValueInitializeWithCopy(scratch, viewType, ctx->viewTypeMeta);
+            PLSwiftEnumProject(scratch, ctx->viewTypeMeta);
+            const void *state = *(const void *const *)(scratch + ctx->toggleState);
+            // Only the address is wanted, and the model keeps the object alive.
+            PLSwiftEnumInject(scratch, ctx->toggleTag, ctx->viewTypeMeta);
+            PLSwiftValueDestroy(scratch, ctx->viewTypeMeta);
+            if (state) return state;
+        }
+    }
+    return NULL;
+}
+
+// Authentication that reports failure instead of trapping.
+//
+// ptrauth_auth_data compiles to an AUT plus a check that traps on mismatch, which is fatal when
+// candidates are being tried: the first wrong one takes the process down. The bare instruction
+// leaves a poisoned pointer instead, without turning -fptrauth-auth-traps off tweak-wide.
+//
+// The result is early-clobber so it cannot share a register with the modifier, which AUTIA also
+// reads.
+__attribute__((always_inline))
+static inline const void *PLAuthenticated(const void *pointer, uint64_t discriminator) {
+    const void *result;
+    __asm__ ("mov %0, %1\n\tautia %0, %2"
+             : "=&r"(result) : "r"(pointer), "r"(discriminator));
+    return result;
+}
+
+// The discriminator a pointer was signed with, or -1 if none authenticates it.
+static int32_t PLClosureDiscriminator(const void *pointer) {
+    const void *bare = ptrauth_strip(pointer, ptrauth_key_function_pointer);
+    if (!bare) return -1;
+    for (uint32_t candidate = 0; candidate <= 0xFFFF; candidate++) {
+        if (PLAuthenticated(pointer, candidate) == bare) return (int32_t)candidate;
+    }
+    return -1;
+}
+
+static BOOL PLClosureSigningMatches(PLRootContext *ctx) {
+    const void *sample = PLSampleToggleState(ctx);
+    // The providers report in asynchronously, so Apple's switch may not be in the list yet.
+    if (!sample) {
+        return NO;
+    }
+
+    // Two words, which is what a closure is; the size is checked rather than assumed.
+    void *probe[2];
+    if ((size_t)PLSwiftBoolClosureSize() > sizeof(probe)) return NO;
+    // Never called; the callback is only there to give it a context, as a real one has.
+    PLSwiftBoolClosureInitialize(probe, PLToggleChanged, NULL);
+    int32_t ours = PLClosureDiscriminator(probe[0]);
+    PLSwiftBoolClosureDestroy(probe);
+
+    const void *theirs = *(const void *const *)((const uint8_t *)sample + ctx->stateSetIsOn);
+    BOOL matches = ours >= 0 && PLAuthenticated(theirs, (uint64_t)ours) ==
+                                ptrauth_strip(theirs, ptrauth_key_function_pointer);
+    PLRootLog(@"[toggle] signing: discriminator=%#x matches=%d", ours, matches);
+    return matches;
+}
+#else
+static BOOL PLClosureSigningMatches(PLRootContext *ctx) { (void)ctx; return YES; }
+#endif
+
+// Settled once: the search runs inside SwiftUI's update, and neither side can change within a
+// process.
+static BOOL PLEnsureClosureSigning(PLRootContext *ctx) {
+    static BOOL settled = NO;
+    static BOOL matches = NO;
+    if (settled) return matches;
+    matches = PLClosureSigningMatches(ctx);
+    // Only a definite answer is remembered: a NO may just mean Apple's switch was not in the list
+    // yet, which a later rebuild may fix.
+    if (matches) settled = YES;
+    return matches;
+}
+
+// Builds the observable object behind one switch. NULL when the class or any of its stored
+// properties could not be resolved, which is what makes the caller fall back to a link row.
+static void *PLMakeToggleState(PLRootContext *ctx, BOOL isOn, PLToggleBinding *binding) {
+    if (!ctx->toggleStateMeta || ctx->stateIsOn < 0 || ctx->stateSetIsOn < 0 ||
+        ctx->stateRegistrar < 0) return NULL;
+    // Checked before allocating, so there is no half-built object to dispose of afterwards.
+    if (PLSwiftObservationRegistrarSize() <= 0 || PLSwiftBoolClosureSize() <= 0) return NULL;
+    if (!PLEnsureClosureSigning(ctx)) return NULL;
+
+    void *object = PLSwiftAllocObject(ctx->toggleStateMeta);
+    if (!object) return NULL;
+
+    // Every stored property is written before the object goes anywhere: swift_allocObject leaves
+    // them uninitialised and the class's deinit releases two of them.
+    gPLStateIsOnOffset = ctx->stateIsOn;
+    *((uint8_t *)object + ctx->stateIsOn) = isOn ? 1 : 0;
+    PLSwiftBoolClosureInitialize((uint8_t *)object + ctx->stateSetIsOn, PLToggleChanged, binding);
+    PLSwiftObservationRegistrarInitialize((uint8_t *)object + ctx->stateRegistrar);
+
+    return object;
+}
+
+// Turns a copied link row into a switch row. Returns NO without having touched the item when
+// anything needed is missing, so the caller can still make it a link.
+static BOOL PLSetItemToggle(PLRootContext *ctx, void *item, NSString *title, UIImage *icon,
+                            NSDictionary *entry) {
+    if (ctx->toggleTag == UINT32_MAX || !ctx->toggleMeta ||
+        ctx->toggleIcon < 0 || ctx->toggleTitle < 0 || ctx->toggleState < 0 ||
+        ctx->linkIcon < 0) return NO;
+
+    const void *iconMeta = PLSwiftTypeByMangledName(kPLIconTypeType);
+    size_t iconSize = iconMeta ? PLSwiftTypeSize(iconMeta) : 0;
+    size_t viewTypeSize = PLSwiftTypeSize(ctx->viewTypeMeta);
+    uint8_t iconScratch[64];
+    if (iconSize == 0 || iconSize > sizeof(iconScratch) || viewTypeSize == 0) return NO;
+
+    void *viewType = (uint8_t *)item + ctx->itemViewType;
+    uint32_t tag = PLSwiftEnumTag(viewType, ctx->viewTypeMeta);
+    const char *caseName = PLSwiftEnumCaseName(ctx->viewTypeMeta, tag);
+    if (!caseName || strcmp(caseName, "link") != 0) return NO;
+
+    void *state = PLMakeToggleState(ctx, PLEntrySwitchValue(entry),
+                                    PLBindingForTitle(title, entry));
+    if (!state) return NO;
+
+    // From here the item is being rewritten and there is no way back. The template's icon is the
+    // only part of the link model worth keeping, and a toggle model does not necessarily keep its
+    // fields where a link model does, so it is copied out before the old value is destroyed.
+    PLSwiftEnumProject(viewType, ctx->viewTypeMeta);
+    PLSwiftValueInitializeWithCopy(iconScratch, (uint8_t *)viewType + ctx->linkIcon, iconMeta);
+    PLSwiftEnumInject(viewType, tag, ctx->viewTypeMeta);
+    PLSwiftValueDestroy(viewType, ctx->viewTypeMeta);
+
+    memset(viewType, 0, viewTypeSize);
+    // A move, not a copy: the reference the scratch holds passes to the field.
+    memcpy((uint8_t *)viewType + ctx->toggleIcon, iconScratch, iconSize);
+    PLSwiftStringInitialize(title.UTF8String, (uint8_t *)viewType + ctx->toggleTitle);
+    // The allocation's reference passes to the model, which releases it with the row.
+    *(void **)((uint8_t *)viewType + ctx->toggleState) = state;
+
+    if (icon) {
+        void *field = (uint8_t *)viewType + ctx->toggleIcon;
+        PLSwiftValueDestroy(field, iconMeta);
+        memset(field, 0, iconSize);
+        *(void **)field = (void *)[icon retain];
+        PLSwiftEnumInject(field, kPLIconImageTag, iconMeta);
+    }
+
+    PLSwiftEnumInject(viewType, ctx->toggleTag, ctx->viewTypeMeta);
+    return YES;
 }
 
 static BOOL PLSetItemAppearance(PLRootContext *ctx, void *item, NSString *title, UIImage *icon) {
@@ -338,7 +690,15 @@ void PLRootListInjectTweakSection(void) {
         PLSwiftValueInitializeWithCopy(item, templateItem, ctx.itemMeta);
         PLSetItemIdentity(&ctx, item, PLIdentityKeyForTitle(titles[i]));
         NSDictionary *record = PLEntriesByTitle()[titles[i]];
-        if (!PLSetItemAppearance(&ctx, item, titles[i], PLIconForEntry(record[@"entry"]))) {
+        UIImage *image = PLIconForEntry(record);
+        NSDictionary *entry = record[@"entry"];
+        // A switch entry becomes a switch row where the model allows it, a link row where not.
+        BOOL inlineSwitch = PLEntryIsInlineSwitch(entry);
+        if (inlineSwitch) PLRootLog(@"[inject] %@ is an inline switch entry", titles[i]);
+        BOOL placed = inlineSwitch && PLSetItemToggle(&ctx, item, titles[i], image, entry);
+        if (placed) {
+            PLRootLog(@"[inject] row %lu (%@) is a switch", (unsigned long)i, titles[i]);
+        } else if (!PLSetItemAppearance(&ctx, item, titles[i], image)) {
             PLRootLog(@"[inject] row %lu is not a link; aborting", (unsigned long)i);
             return;
         }
@@ -727,24 +1087,66 @@ void PLRootListInstallInjector(void) {
 
 // --- opening a row ------------------------------------------------------------------------
 
+@implementation PLEntryPaneController
+
+// The specifiers are handed over before the pane is shown, so there is nothing to load here.
+// Answering with the ivar also keeps the plist-loading path out of reach when this is being used
+// only to resolve a link entry's specifier.
+- (id)specifiers {
+    return _specifiers;
+}
+
+- (void)setPaneSpecifiers:(NSArray *)specifiers {
+    NSMutableArray *copy = [specifiers mutableCopy];
+    [_specifiers release];
+    _specifiers = copy;
+}
+
+@end
+
+// Whether the row is a control the user operates rather than a link. A closed set rather than
+// everything that is not a link, so an unknown cell keeps the path it has always taken.
+static BOOL PLSpecifierIsControl(PSSpecifier *specifier) {
+    // An older Preferences without the property keeps that path too.
+    if (![specifier respondsToSelector:@selector(cellType)]) return NO;
+    switch (specifier.cellType) {
+        case PSSwitchCell:
+        case PSSliderCell:
+        case PSSegmentCell:
+        case PSEditTextCell:
+        case PSSecureEditTextCell:
+        case PSEditTextViewCell:
+        case PSButtonCell:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
 // Builds the controller a PreferenceLoader entry points at.
 //
 // Instantiating the entry's class directly is not enough: a preference controller is configured
 // by its PSSpecifier and comes up empty without one. libprefs already turns an entry into
-// specifiers and resolves a specifier into a controller, loading the bundle lazily, so both steps
-// go through it.
+// specifiers and resolves a specifier into a controller, so both steps go through it.
+//
+// A control entry has no class to instantiate and is shown in a PLEntryPaneController holding its
+// own specifiers.
 static UIViewController *PLControllerForEntry(NSDictionary *record) {
     // Held for the duration: the specifier machinery reads from these long after this function
     // has handed them over.
     NSDictionary *entry = [[record[@"entry"] retain] autorelease];
     NSString *name = [[record[@"name"] retain] autorelease];
     if (![entry isKindOfClass:NSDictionary.class]) return nil;
+    NSString *source = PLEntrySourceDirectory(record);
 
-    // A fresh host per pane. The specifier machinery writes through the target it is given, so
-    // one controller serving every pane in turn accumulates state from panes that are gone. It
-    // cannot be autoreleased either, because the pane it produces refers back to it; it is owned
-    // by the pane instead, which is exactly as long as it is needed.
-    PSListController *host = [[objc_getClass("PSListController") alloc] init];
+    // A fresh host per pane: the specifier machinery writes through the target it is given, so one
+    // controller serving every pane accumulates state from panes that are gone. It is owned by the
+    // pane it produces, which refers back to it.
+    //
+    // Built as the pane's own class either way -- for a control entry the host is the pane, and
+    // libprefs passes the receiver as the specifier's target, which is how a PSSwitchCell reads
+    // and writes its default.
+    PLEntryPaneController *host = [[PLEntryPaneController alloc] init];
     if (![host respondsToSelector:@selector(specifiersFromEntry:sourcePreferenceLoaderBundlePath:title:)]) {
         PLRootLog(@"[open] libprefs entry point missing");
         [host release];
@@ -752,13 +1154,26 @@ static UIViewController *PLControllerForEntry(NSDictionary *record) {
     }
 
     NSArray *specifiers = [host specifiersFromEntry:entry
-                   sourcePreferenceLoaderBundlePath:PLPreferencesDirectory()
+                   sourcePreferenceLoaderBundlePath:source
                                               title:name];
     PSSpecifier *specifier = specifiers.firstObject;
     if (!specifier) {
         PLRootLog(@"[open] no specifier for %@", name);
         [host release];
         return nil;
+    }
+
+    if (PLSpecifierIsControl(specifier)) {
+        // An empty group in front: a control that is the first specifier belongs to no section.
+        NSMutableArray *paneSpecifiers = [NSMutableArray arrayWithObject:[PSSpecifier emptyGroupSpecifier]];
+        [paneSpecifiers addObjectsFromArray:specifiers];
+        [host setPaneSpecifiers:paneSpecifiers];
+        // Parented as a resolved pane below is.
+        [host setRootController:(id)host];
+        [host setParentController:nil];
+        PLRootLog(@"[open] %@ is a control entry (cell %ld); giving it a pane of its own",
+                  name, (long)specifier.cellType);
+        return [host autorelease];
     }
 
     UIViewController *controller = (UIViewController *)[host controllerForSpecifier:specifier];

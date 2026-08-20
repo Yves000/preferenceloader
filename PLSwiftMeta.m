@@ -68,8 +68,38 @@ static const void *PLRelative(const void *base, int32_t offset, BOOL allowIndire
     return indirect ? *(const void *const *)target : target;
 }
 
+// Class metadata, past the Objective-C interop header: isa, superclass, two cache words and the
+// rodata pointer, then the class's own fields. InstanceSize and InstanceAlignMask are what
+// swift_allocObject wants; Description is where the layout is described.
+enum {
+    kPLClassInstanceSize      = 48,
+    kPLClassInstanceAlignMask = 52,
+    kPLClassDescription       = 64,
+};
+
+// Class descriptor, after the prefix shared with structs and enums.
+enum {
+    kPLClassDescNumFields         = 36,
+    kPLClassDescFieldVectorOffset = 40,   // in pointer-sized words from the metadata
+};
+
+// A class's first word is its isa, a pointer; every other metadata kind puts a small integer
+// there. Kinds run to 0x501, so anything above that range is a class.
+enum { kPLMetadataKindLastNonClass = 0x7ff };
+
+static BOOL PLIsClassMetadata(const void *metadata) {
+    if (!metadata) return NO;
+    return (uintptr_t)*(const void *const *)metadata > kPLMetadataKindLastNonClass;
+}
+
+// Structs and enums keep their nominal type descriptor at the second word of their metadata; a
+// class keeps it past the interop header. Everything reading a field descriptor goes through here,
+// so the distinction is drawn once: getting it wrong for a class reads names out of the superclass
+// pointer and matches nothing.
 static const void *PLDescriptor(const void *metadata) {
     if (!metadata) return NULL;
+    if (PLIsClassMetadata(metadata))
+        return PL_STRIP_DATA(*(const void *const *)((const uint8_t *)metadata + kPLClassDescription));
     return PL_STRIP_DATA(((const void *const *)metadata)[1]);
 }
 
@@ -139,6 +169,45 @@ int32_t PLSwiftStructOffsetOfField(const void *metadata, const char *name) {
         if (field && strcmp(field, name) == 0) return (int32_t)PLSwiftStructFieldOffset(metadata, i);
     }
     return -1;
+}
+
+int32_t PLSwiftClassOffsetOfField(const void *metadata, const char *name) {
+    if (!PLIsClassMetadata(metadata) || !name) return -1;
+    const void *desc = PLDescriptor(metadata);
+    if (!desc) return -1;
+    uint32_t count = *(const uint32_t *)((const uint8_t *)desc + kPLClassDescNumFields);
+    uint32_t vectorWord = *(const uint32_t *)((const uint8_t *)desc + kPLClassDescFieldVectorOffset);
+    if (count == 0 || vectorWord == 0) return -1;
+
+    // Pointer-sized entries, unlike a struct's, and read through the metadata: with a resilient
+    // superclass the offsets are only known once the metadata has been built.
+    const uintptr_t *offsets = (const uintptr_t *)((const void *const *)metadata + vectorWord);
+    uint32_t instanceSize = *(const uint32_t *)((const uint8_t *)metadata + kPLClassInstanceSize);
+
+    // The field descriptor lists the properties in the same order as the offset vector.
+    for (uint32_t i = 0; i < count; i++) {
+        const char *field = PLRecordName(metadata, i);
+        if (!field || strcmp(field, name) != 0) continue;
+        uintptr_t offset = offsets[i];
+        // A plausible offset is inside the object and past its header; anything else means the
+        // vector was not where it was expected.
+        if (offset < 16 || offset >= instanceSize) return -1;
+        return (int32_t)offset;
+    }
+    return -1;
+}
+
+void *PLSwiftAllocObject(const void *metadata) {
+    static PLAllocObjectFn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (PLAllocObjectFn)dlsym(RTLD_DEFAULT, "swift_allocObject");
+    });
+    if (!fn || !PLIsClassMetadata(metadata)) return NULL;
+    uint32_t size = *(const uint32_t *)((const uint8_t *)metadata + kPLClassInstanceSize);
+    uint16_t alignMask = *(const uint16_t *)((const uint8_t *)metadata + kPLClassInstanceAlignMask);
+    if (size < 16) return NULL;
+    return fn(metadata, size, alignMask);
 }
 
 uint32_t PLSwiftEnumTag(const void *value, const void *metadata) {

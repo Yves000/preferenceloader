@@ -73,7 +73,7 @@ libprefs_LDFLAGS = $(PL_PREFERENCES_TBD)
 libprefs_INSTALL_PATH = /usr/lib
 
 TWEAK_NAME = PreferenceLoader
-PreferenceLoader_FILES = Tweak.xm PLSwiftMeta.m PLHeap.m PLRootList.m PLCrashLog.m PLSwiftString.swift
+PreferenceLoader_FILES = Tweak.xm PLSwiftMeta.m PLHeap.m PLRootList.m PLCrashLog.m PLSwiftString.swift PLSwiftToggle.swift
 
 # The navigation trace is compiled into DEBUG builds only. logos generates hook registration
 # ahead of the C preprocessor, so a %hook cannot be #if'd out of a file that is being built --
