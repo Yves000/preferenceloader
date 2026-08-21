@@ -994,7 +994,11 @@ void PLRootListFillDetailColumn(void) {
         return;
     }
 
-    if (column.viewControllers.count == 1 && column.viewControllers.firstObject == pane) return;
+    // The root is what matters, not the depth: a pane navigates within the column -- its root
+    // controller is the column, so a page it pushes lands on top of itself -- and this runs in the
+    // containment callback of that very push. Requiring a stack of exactly one would reset the
+    // column the moment the pane pushed, taking the user straight back out of every subpage.
+    if (column.viewControllers.firstObject == pane) return;
 
     // Remember the host for the later restore, but never one of our own panes: with one pane
     // already in the column and another tweak selected, the column's root is that first pane, and
